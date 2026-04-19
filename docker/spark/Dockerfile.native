@@ -1,0 +1,96 @@
+# syntax=docker/dockerfile:1.6
+#
+# DGX Spark / GB10 — native kernels variant.
+#
+# Unlike docker/spark/Dockerfile (which installs the Jetson Zoo onnxruntime
+# 1.19 wheel and relies on PTX JIT to reach sm_121), this variant builds
+# onnxruntime from source against CUDA 13 + TensorRT 10 + sm_120;sm_121.
+# Pros: native Blackwell kernels, TRT EP available, zero driver JIT cost.
+# Cons: ~30–60 min build stage the first time.
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG BASE_IMAGE
+ARG ORT_VERSION=v1.24.4
+ARG CUDA_ARCHITECTURES=121-real
+
+# ---------- Stage: build onnxruntime-gpu wheel from source ----------
+FROM ${BASE_IMAGE} AS ort-build
+ARG DEBIAN_FRONTEND
+ARG ORT_VERSION
+ARG CUDA_ARCHITECTURES
+
+# Toolchain + deadsnakes python 3.11 (to match frigate's ABI).
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends \
+       software-properties-common ca-certificates gnupg \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends \
+       git wget build-essential cmake ninja-build ccache \
+       python3.11 python3.11-dev python3.11-venv \
+       libnuma-dev \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The NGC base pre-packages pip without a RECORD file; wipe its manifest
+# so get-pip.py can replace it cleanly (same trick as spark.hcl BASE_HOOK).
+RUN find /usr/lib/python3/dist-packages -maxdepth 1 -type d \
+      \( -name '*.dist-info' -o -name '*.egg-info' \) -exec rm -rf {} + 2>/dev/null || true \
+    && wget -q https://bootstrap.pypa.io/get-pip.py -O /tmp/get-pip.py \
+    && python3 /tmp/get-pip.py "pip" \
+    && rm /tmp/get-pip.py \
+    && pip3 install --no-cache-dir "cmake==3.28.*" "setuptools<78" "wheel" "packaging" "numpy<2"
+
+# ORT build inputs — pin to a release that ships CUDA-13-compatible CMake
+# logic. 1.24 is the newest stable (1.23+ added CUDA 13 build paths).
+WORKDIR /src
+RUN git clone --depth=1 --branch ${ORT_VERSION} --recursive \
+      https://github.com/microsoft/onnxruntime.git .
+
+ENV CCACHE_DIR=/root/.ccache CCACHE_MAXSIZE=4G
+
+RUN --mount=type=cache,target=/root/.ccache \
+    export PATH="/usr/lib/ccache:$PATH" \
+    && ./build.sh --config Release --parallel \
+       --use_cuda \
+       --cuda_home /usr/local/cuda \
+       --cudnn_home /usr \
+       --use_tensorrt --tensorrt_home /usr \
+       --build_wheel \
+       --allow_running_as_root \
+       --skip_tests \
+       --cmake_extra_defines \
+         "CMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}" \
+         "onnxruntime_BUILD_UNIT_TESTS=OFF"
+
+# Collect the wheel so later stages can COPY it.
+RUN mkdir -p /out && cp /src/build/Linux/Release/dist/onnxruntime_gpu-*.whl /out/
+
+# ---------- Final stage: swap ORT wheel into the frigate image ----------
+FROM deps AS frigate-spark-native
+ARG DEBIAN_FRONTEND
+
+ENV S6_CMD_WAIT_FOR_SERVICES_MAXTIME=0
+
+COPY --from=ort-build /out/onnxruntime_gpu-*.whl /tmp/
+RUN pip3 uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null; \
+    pip3 install --no-cache-dir /tmp/onnxruntime_gpu-*.whl \
+    && rm /tmp/onnxruntime_gpu-*.whl
+
+WORKDIR /opt/frigate/
+COPY --from=rootfs / /
+
+# Defensive runtime patches for Blackwell sm_121. piotr-siedlak/frigate-gb10
+# found these avoid intermittent PTX / graph-fusion crashes on GB10; we
+# haven't reproduced them under short smoke loads, but the cost is nil
+# and the failure mode is "detector process dies under sustained load."
+RUN sed -i 's/CudaGraphRunner\.is_model_supported(model_type)/False/' \
+        /opt/frigate/frigate/detectors/detection_runners.py \
+    && sed -i 's/ONNXModelRunner\.is_cpu_complex_model(model_type)/True/' \
+        /opt/frigate/frigate/detectors/detection_runners.py
+
+RUN echo "/usr/local/cuda/lib64" > /etc/ld.so.conf.d/cuda.conf \
+    && ldconfig
+
+HEALTHCHECK --start-period=600s --start-interval=5s --interval=15s --timeout=5s --retries=3 \
+    CMD curl --fail --silent --show-error http://127.0.0.1:5000/api/version || exit 1
