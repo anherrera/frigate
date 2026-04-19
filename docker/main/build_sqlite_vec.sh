@@ -8,6 +8,8 @@ source /etc/os-release
 
 if [[ "$VERSION_ID" == "12" ]]; then
     sed -i '/^Types:/s/deb/& deb-src/' /etc/apt/sources.list.d/debian.sources
+elif [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+    sed -i '/^Types:/s/deb/& deb-src/' /etc/apt/sources.list.d/ubuntu.sources
 else
     cp /etc/apt/sources.list /etc/apt/sources.list.d/sources-src.list
     sed -i 's|deb http|deb-src http|g' /etc/apt/sources.list.d/sources-src.list
